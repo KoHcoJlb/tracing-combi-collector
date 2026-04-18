@@ -1,48 +1,65 @@
-Layer that pushes logs formatted with `tracing-subscriber` into [Grafana Loki](https://grafana.com/oss/loki/) and
-attaching all fields
-as [Loki's structured metadata](https://grafana.com/docs/loki/latest/get-started/labels/structured-metadata/).
+### Tracing layer that sends both human-readable log line (formatted with `tracing-subscriber`) and all it's fields into a log aggregation system in a structured way
 
-It combines both log readability and convenient manipulation (filtering ` | field = "value"`, aggregation, etc)
-without the need for parsing.
+#### Supported collectors are:
+
+- [Victorialogs](https://docs.victoriametrics.com/victorialogs/), uses JSON with `_msg` set to a formatted log line
+- [Grafana Loki](https://grafana.com/oss/loki/), uses formatted log line, storing all the fields as [structured metadata](https://grafana.com/docs/loki/latest/get-started/labels/structured-metadata/)
+
+## Purpose
+
+When used with log aggregation system, JSON logs are easy to manipulate but hard to read for a human.  
+So this library combines both approaches, ingesting all fields in a structured way while also adding full
+human-readable log line
+
+![Demo image](demo.png)
 
 Example
 ---
 
 ```rust
-use eyre::Result;
 use std::time::Duration;
-use tokio::spawn;
-use tokio::time::sleep;
-use tracing::{info, info_span};
-use tracing_loki_fmt::Builder;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, registry};
+
+use eyre::Result;
+use tokio::{spawn, time::sleep};
+use tracing::{debug, info, info_span};
+use tracing_combi_collector::sender::{loki::LokiSender, victorialogs::VictorialogsSender};
+use tracing_subscriber::{fmt, layer::SubscriberExt, registry, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let builder = Builder::new(
-        "http://grafana.proxmox/loki/api/v1/push",
-        fmt::layer().without_time(),
-    )?;
-    let (layer, task) = builder
+    // Loki
+    let sender = LokiSender::new("http://grafana.proxmox/loki/api/v1/push")?
         .add_label("this_is_label", "test456")
         .add_label("job", "test")
-        .add_field("this_is_static_field", "Test6666")
-        .build();
-    spawn(task.run());
+        .add_field("this_is_static_field", "Test6666");
+
+    // or Victorialogs
+    let sender = VictorialogsSender::new("http://grafana.proxmox/vl/insert/jsonline")?
+        .stream_fields(["job", "hello"])
+        .extra_field("job", "test");
+
+    let (layer, task) =
+        tracing_combi_collector::Layer::new(sender, fmt::layer().without_time().with_level(false));
+    spawn(task);
 
     registry()
+        .with(EnvFilter::new("test2=trace,tracing_combi_collector=trace"))
         .with(fmt::layer())
         .with(layer)
         .init();
 
-    let _span1 = info_span!("span1", hello = "world").entered();
-    let _span2 = info_span!("span2", world = "test").entered();
+    let _span1 = info_span!("span1", hello = "world", override1 = 1, override2 = 1).entered();
+    let _span2 = info_span!("span2", world = "test", override1 = 2).entered();
 
-    info!(test = 123, test1 = "456", "hello world");
+    info!(test = 123, test1 = "456", bool = true, override2 = 3, "hello world");
 
-    sleep(Duration::from_secs(15)).await;
+    for i in 0..500 {
+        debug!(i);
+    }
+
+    // wait for the logs to be sent 
+    // they are sent at 5-second intervals or when the buffer is full, whichever comes first
+    sleep(Duration::from_secs(10)).await;
 
     Ok(())
 }
